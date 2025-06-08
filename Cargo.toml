@@ -7,9 +7,13 @@ version = "0.0.0"
 crate-type = ["cdylib"]
 
 [dependencies]
+btleplug = "0.11.8"
+# lsl = "0.1.1"
 # Default enable napi4 feature, see https://nodejs.org/api/n-api.html#node-api-version-matrix
-napi = { version = "2.12.2", default-features = false, features = ["napi4"] }
+napi = { version = "2.12.2", default-features = false, features = ["async", "napi4"] }
 napi-derive = "2.12.2"
+tokio = { version = "1.45.1", features = ["full"] }
+# xdf = "0.1.2"
 
 [build-dependencies]
 napi-build = "2.0.1"
