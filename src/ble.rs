@@ -221,7 +221,7 @@ impl BleConnector<PlatformPeripheral> {
     // Set first byte to length - 1 (like TypeScript encoded[0] = encoded.length - 1)
     buffer[0] = (buffer.len() - 1) as u8;
     
-    device.write(&control_char, &buffer, btleplug::api::WriteType::WithResponse).await?;
+    device.write(&control_char, &buffer, btleplug::api::WriteType::WithoutResponse).await?;
     Ok(())
   }
 

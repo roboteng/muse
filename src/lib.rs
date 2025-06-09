@@ -87,9 +87,18 @@ impl MuseDevice {
       connector.start_streaming(data_tx).await
         .map_err(|e| napi::Error::from_reason(format!("Failed to start streaming: {}", e)))?;
       
-      // Spawn background task that owns the LSL outlets
-      let streaming_handle = tokio::task::spawn_local(async move {
-        Self::streaming_task(data_rx).await
+      // Spawn a regular task that handles the blocking LSL operations
+      let streaming_handle = tokio::task::spawn(async move {
+        // Run LSL operations in a blocking task since they're not Send
+        tokio::task::spawn_blocking(move || {
+          // Create a new Tokio runtime for LSL operations
+          let rt = tokio::runtime::Runtime::new().unwrap();
+          rt.block_on(async {
+            Self::streaming_task(data_rx).await
+          });
+        }).await.unwrap_or_else(|e| {
+          eprintln!("Streaming task error: {:?}", e);
+        });
       });
       
       // Store the task handle
