@@ -1,20 +1,40 @@
 use btleplug::api::{Central, Characteristic, Manager as _, Peripheral, ScanFilter};
 use btleplug::platform::{Adapter, Manager, Peripheral as PlatformPeripheral};
+use futures::stream::StreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::timeout;
 use uuid::{Uuid, uuid};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const MUSE_SERVICE_UUID: Uuid = uuid!("0000fe8d-0000-1000-8000-00805f9b34fb");
-const CONTROL_CHAR_UUID: &str = "273e0001-4c4d-454d-96be-f03bac821358";
+// EEG Characteristic UUIDs
+const EEG_TP9_UUID: Uuid = uuid!("273e0003-4c4d-454d-96be-f03bac821358");
+const EEG_AF7_UUID: Uuid = uuid!("273e0004-4c4d-454d-96be-f03bac821358");
+const EEG_AF8_UUID: Uuid = uuid!("273e0005-4c4d-454d-96be-f03bac821358");
+const EEG_TP10_UUID: Uuid = uuid!("273e0006-4c4d-454d-96be-f03bac821358");
+const EEG_AUX_UUID: Uuid = uuid!("273e0007-4c4d-454d-96be-f03bac821358");
+
+// PPG Characteristic UUIDs  
+const PPG_AMBIENT_UUID: Uuid = uuid!("273e000f-4c4d-454d-96be-f03bac821358");
+const PPG_INFRARED_UUID: Uuid = uuid!("273e0010-4c4d-454d-96be-f03bac821358");
+const PPG_RED_UUID: Uuid = uuid!("273e0011-4c4d-454d-96be-f03bac821358");
+
+#[derive(Debug, Clone)]
+pub enum DataType {
+  Eeg,
+  Ppg,
+}
 
 pub struct BleConnector<P: Peripheral> {
   adapter: Adapter,
   device: Option<P>,
   characteristics: Mutex<HashMap<Uuid, Characteristic>>,
+  streaming: Arc<RwLock<bool>>,
+  data_tx: Option<mpsc::UnboundedSender<(DataType, Vec<f32>)>>,
 }
 
 impl BleConnector<PlatformPeripheral> {
@@ -27,6 +47,8 @@ impl BleConnector<PlatformPeripheral> {
       adapter,
       device: None,
       characteristics: Mutex::new(HashMap::new()),
+      streaming: Arc::new(RwLock::new(false)),
+      data_tx: None,
     })
   }
 
@@ -90,6 +112,9 @@ impl BleConnector<PlatformPeripheral> {
   }
 
   pub async fn disconnect(&mut self) -> Result<()> {
+    // Stop streaming first
+    self.stop_streaming().await?;
+    
     if let Some(device) = &self.device {
       device.disconnect().await?;
     }
@@ -101,7 +126,113 @@ impl BleConnector<PlatformPeripheral> {
     self.device.is_some()
   }
 
+
+  pub async fn start_streaming(&mut self, data_tx: mpsc::UnboundedSender<(DataType, Vec<f32>)>) -> Result<()> {
+    if !self.is_connected() {
+      return Err("Device not connected".into());
+    }
+
+    self.data_tx = Some(data_tx);
+    
+    // Discover and setup characteristics for notifications
+    self.setup_notifications().await?;
+    
+    *self.streaming.write().await = true;
+    Ok(())
+  }
+
+  pub async fn stop_streaming(&mut self) -> Result<()> {
+    *self.streaming.write().await = false;
+    
+    // Stop notifications on all characteristics
+    if let Some(device) = &self.device {
+      let eeg_uuids = [EEG_TP9_UUID, EEG_AF7_UUID, EEG_AF8_UUID, EEG_TP10_UUID, EEG_AUX_UUID];
+      let ppg_uuids = [PPG_AMBIENT_UUID, PPG_INFRARED_UUID, PPG_RED_UUID];
+      
+      for uuid in eeg_uuids.iter().chain(ppg_uuids.iter()) {
+        if let Some(char) = self.get_characteristic(uuid).await {
+          let _ = device.unsubscribe(&char).await; // Ignore errors
+        }
+      }
+    }
+    
+    // Clear data sender
+    self.data_tx = None;
+    Ok(())
+  }
+
+
+  async fn setup_notifications(&mut self) -> Result<()> {
+    let device = self.device.as_ref().ok_or("Device not connected")?;
+    
+    // Discover characteristics
+    let eeg_uuids = [EEG_TP9_UUID, EEG_AF7_UUID, EEG_AF8_UUID, EEG_TP10_UUID, EEG_AUX_UUID];
+    let ppg_uuids = [PPG_AMBIENT_UUID, PPG_INFRARED_UUID, PPG_RED_UUID];
+    
+    let mut chars = self.characteristics.lock().await;
+    
+    for service in device.services() {
+      for char in service.characteristics {
+        let char_uuid = char.uuid;
+        if eeg_uuids.contains(&char_uuid) || ppg_uuids.contains(&char_uuid) {
+          chars.insert(char_uuid, char.clone());
+          
+          // Subscribe to characteristic notifications
+          device.subscribe(&char).await?;
+        }
+      }
+    }
+    
+    // Start a task to read notifications and send them through the channel
+    if let Some(data_tx) = &self.data_tx {
+      let tx = data_tx.clone();
+      let device_clone = device.clone();
+      let streaming = self.streaming.clone();
+      
+      tokio::spawn(async move {
+        let mut notifications = device_clone.notifications().await.unwrap();
+        
+        while let Some(notification) = notifications.next().await {
+          let streaming_guard = streaming.read().await;
+          if *streaming_guard {
+            let char_uuid = notification.uuid;
+            let data = notification.value;
+            
+            if let Ok(parsed_data) = parse_muse_data(&data) {
+              let data_type = if eeg_uuids.contains(&char_uuid) {
+                DataType::Eeg
+              } else if ppg_uuids.contains(&char_uuid) {
+                DataType::Ppg  
+              } else {
+                continue;
+              };
+              
+              let _ = tx.send((data_type, parsed_data));
+            }
+          }
+        }
+      });
+    }
+    
+    Ok(())
+  }
+
   async fn get_characteristic(&self, uuid: &Uuid) -> Option<Characteristic> {
     self.characteristics.lock().await.get(uuid).cloned()
   }
+}
+
+fn parse_muse_data(data: &[u8]) -> Result<Vec<f32>> {
+  // Parse Muse data format (this is a simplified version)
+  // The actual format may need adjustment based on Muse protocol
+  let mut samples = Vec::new();
+  
+  for chunk in data.chunks(4) {
+    if chunk.len() == 4 {
+      let value = i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32;
+      samples.push(value);
+    }
+  }
+  
+  Ok(samples)
 }

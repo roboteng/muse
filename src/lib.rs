@@ -2,20 +2,24 @@ use btleplug::platform::Peripheral as PlatformPeripheral;
 use napi::{Env, JsBoolean, JsNumber, JsString, Result};
 use napi_derive::napi;
 use std::sync::{Arc, RwLock};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 mod ble;
-use ble::BleConnector;
+use ble::{BleConnector, DataType};
 
 #[napi]
 pub struct MuseDevice {
   connector: Arc<Mutex<Option<BleConnector<PlatformPeripheral>>>>,
   target_uuid: Option<String>,
+  #[allow(dead_code)]
   rssi_interval_ms: Option<u32>,
+  #[allow(dead_code)]
   xdf_record_path: Option<String>,
   connected: Arc<RwLock<bool>>,
   device_name: Arc<RwLock<Option<String>>>,
   device_uuid: Arc<RwLock<Option<String>>>,
+  streaming: Arc<RwLock<bool>>,
+  streaming_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 #[napi]
@@ -38,6 +42,8 @@ impl MuseDevice {
       connected: Arc::new(RwLock::new(false)),
       device_name: Arc::new(RwLock::new(None)),
       device_uuid: Arc::new(RwLock::new(None)),
+      streaming: Arc::new(RwLock::new(false)),
+      streaming_task: Arc::new(Mutex::new(None)),
     }
   }
 
@@ -71,12 +77,48 @@ impl MuseDevice {
 
   #[napi]
   pub async fn start_streaming(&self) -> napi::Result<()> {
-    todo!()
+    let mut connector_guard = self.connector.lock().await;
+    
+    if let Some(connector) = connector_guard.as_mut() {
+      // Create channel for data streaming
+      let (data_tx, data_rx) = mpsc::unbounded_channel::<(DataType, Vec<f32>)>();
+      
+      // Start BLE streaming with the sender
+      connector.start_streaming(data_tx).await
+        .map_err(|e| napi::Error::from_reason(format!("Failed to start streaming: {}", e)))?;
+      
+      // Spawn background task that owns the LSL outlets
+      let streaming_handle = tokio::task::spawn_local(async move {
+        Self::streaming_task(data_rx).await
+      });
+      
+      // Store the task handle
+      *self.streaming_task.lock().await = Some(streaming_handle);
+      *self.streaming.write().map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = true;
+    } else {
+      return Err(napi::Error::from_reason("Device not connected"));
+    }
+    
+    Ok(())
   }
 
   #[napi]
   pub async fn stop_streaming(&self) -> napi::Result<()> {
-    todo!()
+    let mut connector_guard = self.connector.lock().await;
+    
+    if let Some(connector) = connector_guard.as_mut() {
+      connector.stop_streaming().await
+        .map_err(|e| napi::Error::from_reason(format!("Failed to stop streaming: {}", e)))?;
+    }
+    
+    // Stop the background streaming task
+    if let Some(handle) = self.streaming_task.lock().await.take() {
+      handle.abort();
+    }
+    
+    *self.streaming.write().map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = false;
+    
+    Ok(())
   }
 
   #[napi]
@@ -119,13 +161,65 @@ impl MuseDevice {
 
   #[napi(getter)]
   pub fn is_streaming(&self, env: Env) -> Result<JsBoolean> {
-    env.get_boolean(false)
+    let streaming = *self.streaming.read().map_err(|_| napi::Error::from_reason("Failed to acquire read lock"))?;
+    env.get_boolean(streaming)
   }
 
   #[napi(getter)]
   pub fn is_connected(&self, env: Env) -> Result<JsBoolean> {
     let connected = *self.connected.read().map_err(|_| napi::Error::from_reason("Failed to acquire read lock"))?;
     env.get_boolean(connected)
+  }
+
+  async fn streaming_task(mut data_rx: mpsc::UnboundedReceiver<(DataType, Vec<f32>)>) {
+    use lsl::{StreamOutlet, StreamInfo, ChannelFormat, Pushable};
+    
+    // Create LSL outlets
+    let eeg_info = match StreamInfo::new(
+      "Muse S Gen 2 EEG",
+      "EEG", 
+      5, // 5 EEG channels
+      256.0, // EEG sample rate
+      ChannelFormat::Float32,
+      "muse-eeg"
+    ) {
+      Ok(info) => info,
+      Err(_) => return, // Exit task if we can't create stream info
+    };
+    
+    let eeg_outlet = match StreamOutlet::new(&eeg_info, 12, 360) {
+      Ok(outlet) => outlet,
+      Err(_) => return,
+    };
+
+    let ppg_info = match StreamInfo::new(
+      "Muse S Gen 2 PPG",
+      "PPG",
+      3, // 3 PPG channels
+      64.0, // PPG sample rate
+      ChannelFormat::Float32,
+      "muse-s-ppg"
+    ) {
+      Ok(info) => info,
+      Err(_) => return,
+    };
+    
+    let ppg_outlet = match StreamOutlet::new(&ppg_info, 6, 360) {
+      Ok(outlet) => outlet,
+      Err(_) => return,
+    };
+
+    // Process incoming data
+    while let Some((data_type, samples)) = data_rx.recv().await {
+      match data_type {
+        DataType::Eeg => {
+          let _ = eeg_outlet.push_sample(&samples);
+        }
+        DataType::Ppg => {
+          let _ = ppg_outlet.push_sample(&samples);
+        }
+      }
+    }
   }
 }
 

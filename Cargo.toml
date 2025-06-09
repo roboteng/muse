@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 btleplug = "0.11.8"
+futures = "0.3"
 lsl = { git = "https://github.com/labstreaminglayer/liblsl-rust.git", branch = "main" }
 # Default enable napi4 feature, see https://nodejs.org/api/n-api.html#node-api-version-matrix
 napi = { version = "2.12.2", default-features = false, features = [
