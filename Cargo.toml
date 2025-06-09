@@ -1,7 +1,7 @@
 [package]
-edition = "2021"
+edition = "2024"
 name = "trevorsettles_muse"
-version = "0.0.0"
+version = "0.0.1"
 
 [lib]
 crate-type = ["cdylib"]
@@ -16,6 +16,7 @@ napi = { version = "2.12.2", default-features = false, features = [
 ] }
 napi-derive = "2.12.2"
 tokio = { version = "1.45.1", features = ["full"] }
+uuid = "1.17.0"
 xdf = "0.1.2"
 
 [build-dependencies]
