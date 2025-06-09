@@ -25,8 +25,8 @@ const PPG_RED_UUID: Uuid = uuid!("273e0011-4c4d-454d-96be-f03bac821358");
 
 #[derive(Debug, Clone)]
 pub enum DataType {
-  Eeg,
-  Ppg,
+  Eeg([f32; 5]),  // 5 EEG channels: TP9, AF7, AF8, TP10, AUX
+  Ppg([f32; 3]),  // 3 PPG channels: AMBIENT, INFRARED, RED
 }
 
 pub struct BleConnector<P: Peripheral> {
@@ -34,7 +34,7 @@ pub struct BleConnector<P: Peripheral> {
   device: Option<P>,
   characteristics: Mutex<HashMap<Uuid, Characteristic>>,
   streaming: Arc<RwLock<bool>>,
-  data_tx: Option<mpsc::UnboundedSender<(DataType, Vec<f32>)>>,
+  data_tx: Option<mpsc::UnboundedSender<DataType>>,
 }
 
 impl BleConnector<PlatformPeripheral> {
@@ -127,7 +127,7 @@ impl BleConnector<PlatformPeripheral> {
   }
 
 
-  pub async fn start_streaming(&mut self, data_tx: mpsc::UnboundedSender<(DataType, Vec<f32>)>) -> Result<()> {
+  pub async fn start_streaming(&mut self, data_tx: mpsc::UnboundedSender<DataType>) -> Result<()> {
     if !self.is_connected() {
       return Err("Device not connected".into());
     }
@@ -200,14 +200,22 @@ impl BleConnector<PlatformPeripheral> {
             
             if let Ok(parsed_data) = parse_muse_data(&data) {
               let data_type = if eeg_uuids.contains(&char_uuid) {
-                DataType::Eeg
+                if let Ok(eeg_array) = parsed_data.get(0..5).unwrap_or(&[]).try_into() {
+                  DataType::Eeg(eeg_array)
+                } else {
+                  continue; // Skip if not enough EEG data
+                }
               } else if ppg_uuids.contains(&char_uuid) {
-                DataType::Ppg  
+                if let Ok(ppg_array) = parsed_data.get(0..3).unwrap_or(&[]).try_into() {
+                  DataType::Ppg(ppg_array)
+                } else {
+                  continue; // Skip if not enough PPG data
+                }
               } else {
                 continue;
               };
               
-              let _ = tx.send((data_type, parsed_data));
+              let _ = tx.send(data_type);
             }
           }
         }

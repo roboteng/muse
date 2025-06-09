@@ -81,7 +81,7 @@ impl MuseDevice {
     
     if let Some(connector) = connector_guard.as_mut() {
       // Create channel for data streaming
-      let (data_tx, data_rx) = mpsc::unbounded_channel::<(DataType, Vec<f32>)>();
+      let (data_tx, data_rx) = mpsc::unbounded_channel::<DataType>();
       
       // Start BLE streaming with the sender
       connector.start_streaming(data_tx).await
@@ -171,7 +171,7 @@ impl MuseDevice {
     env.get_boolean(connected)
   }
 
-  async fn streaming_task(mut data_rx: mpsc::UnboundedReceiver<(DataType, Vec<f32>)>) {
+  async fn streaming_task(mut data_rx: mpsc::UnboundedReceiver<DataType>) {
     use lsl::{StreamOutlet, StreamInfo, ChannelFormat, Pushable};
     
     // Create LSL outlets
@@ -210,13 +210,13 @@ impl MuseDevice {
     };
 
     // Process incoming data
-    while let Some((data_type, samples)) = data_rx.recv().await {
+    while let Some(data_type) = data_rx.recv().await {
       match data_type {
-        DataType::Eeg => {
-          let _ = eeg_outlet.push_sample(&samples);
+        DataType::Eeg(samples) => {
+          let _ = eeg_outlet.push_sample(&samples.to_vec());
         }
-        DataType::Ppg => {
-          let _ = ppg_outlet.push_sample(&samples);
+        DataType::Ppg(samples) => {
+          let _ = ppg_outlet.push_sample(&samples.to_vec());
         }
       }
     }
