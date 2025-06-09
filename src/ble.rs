@@ -4,7 +4,7 @@ use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::timeout;
 use uuid::{Uuid, uuid};
 
@@ -22,15 +22,15 @@ const EEG_AF8_UUID: Uuid = uuid!("273e0005-4c4d-454d-96be-f03bac821358");
 const EEG_TP10_UUID: Uuid = uuid!("273e0006-4c4d-454d-96be-f03bac821358");
 const EEG_AUX_UUID: Uuid = uuid!("273e0007-4c4d-454d-96be-f03bac821358");
 
-// PPG Characteristic UUIDs  
+// PPG Characteristic UUIDs
 const PPG_AMBIENT_UUID: Uuid = uuid!("273e000f-4c4d-454d-96be-f03bac821358");
 const PPG_INFRARED_UUID: Uuid = uuid!("273e0010-4c4d-454d-96be-f03bac821358");
 const PPG_RED_UUID: Uuid = uuid!("273e0011-4c4d-454d-96be-f03bac821358");
 
 #[derive(Debug, Clone)]
 pub enum DataType {
-  Eeg([f32; 5]),  // 5 EEG channels: TP9, AF7, AF8, TP10, AUX
-  Ppg([f32; 3]),  // 3 PPG channels: AMBIENT, INFRARED, RED
+  Eeg([f32; 5]), // 5 EEG channels: TP9, AF7, AF8, TP10, AUX
+  Ppg([f32; 3]), // 3 PPG channels: AMBIENT, INFRARED, RED
 }
 
 // Data structures for chunking like TypeScript implementation
@@ -41,7 +41,7 @@ const PPG_CHANNEL_COUNT: usize = 3;
 
 #[derive(Clone)]
 struct ChannelChunks {
-  eeg_chunks: [[u8; EEG_CHUNK_SIZE]; EEG_CHANNEL_COUNT], // [channel_count][chunk_size] 
+  eeg_chunks: [[u8; EEG_CHUNK_SIZE]; EEG_CHANNEL_COUNT], // [channel_count][chunk_size]
   ppg_chunks: [[f32; PPG_CHUNK_SIZE]; PPG_CHANNEL_COUNT], // [channel_count][chunk_size]
 }
 
@@ -52,13 +52,13 @@ impl ChannelChunks {
       ppg_chunks: [[0.0f32; PPG_CHUNK_SIZE]; PPG_CHANNEL_COUNT],
     }
   }
-  
+
   fn reset_eeg(&mut self) {
     for chunk in &mut self.eeg_chunks {
       chunk.fill(0);
     }
   }
-  
+
   fn reset_ppg(&mut self) {
     for chunk in &mut self.ppg_chunks {
       chunk.fill(0.0);
@@ -151,7 +151,7 @@ impl BleConnector<PlatformPeripheral> {
   pub async fn disconnect(&mut self) -> Result<()> {
     // Stop streaming first
     self.stop_streaming().await?;
-    
+
     if let Some(device) = &self.device {
       device.disconnect().await?;
     }
@@ -163,22 +163,21 @@ impl BleConnector<PlatformPeripheral> {
     self.device.is_some()
   }
 
-
   pub async fn start_streaming(&mut self, data_tx: mpsc::UnboundedSender<DataType>) -> Result<()> {
     if !self.is_connected() {
       return Err("Device not connected".into());
     }
 
     self.data_tx = Some(data_tx);
-    
+
     // Discover and setup characteristics for notifications
     self.setup_notifications().await?;
-    
+
     // Send device control commands like TypeScript implementation
     for command in &["h", "p50", "s", "d"] {
       self.send_control_command(command.as_bytes()).await?;
     }
-    
+
     *self.streaming.write().await = true;
     Ok(())
   }
@@ -186,60 +185,79 @@ impl BleConnector<PlatformPeripheral> {
   pub async fn stop_streaming(&mut self) -> Result<()> {
     // Send halt command like TypeScript implementation
     self.send_control_command("h".as_bytes()).await?;
-    
+
     *self.streaming.write().await = false;
-    
+
     // Stop notifications on all characteristics
     if let Some(device) = &self.device {
-      let eeg_uuids = [EEG_TP9_UUID, EEG_AF7_UUID, EEG_AF8_UUID, EEG_TP10_UUID, EEG_AUX_UUID];
+      let eeg_uuids = [
+        EEG_TP9_UUID,
+        EEG_AF7_UUID,
+        EEG_AF8_UUID,
+        EEG_TP10_UUID,
+        EEG_AUX_UUID,
+      ];
       let ppg_uuids = [PPG_AMBIENT_UUID, PPG_INFRARED_UUID, PPG_RED_UUID];
-      
+
       for uuid in eeg_uuids.iter().chain(ppg_uuids.iter()) {
         if let Some(char) = self.get_characteristic(uuid).await {
           let _ = device.unsubscribe(&char).await; // Ignore errors
         }
       }
     }
-    
+
     // Clear data sender
     self.data_tx = None;
     Ok(())
   }
 
-
   async fn send_control_command(&self, cmd: &[u8]) -> Result<()> {
     let device = self.device.as_ref().ok_or("Device not connected")?;
-    let control_char = self.get_characteristic(&CONTROL_UUID).await
+    let control_char = self
+      .get_characteristic(&CONTROL_UUID)
+      .await
       .ok_or("Control characteristic not found")?;
-    
+
     // Create command buffer like TypeScript implementation: X{cmd}\n
     let mut buffer = Vec::with_capacity(cmd.len() + 2);
     buffer.push(b'X');
     buffer.extend_from_slice(cmd);
     buffer.push(b'\n');
-    
+
     // Set first byte to length - 1 (like TypeScript encoded[0] = encoded.length - 1)
     buffer[0] = (buffer.len() - 1) as u8;
-    
-    device.write(&control_char, &buffer, btleplug::api::WriteType::WithoutResponse).await?;
+
+    device
+      .write(
+        &control_char,
+        &buffer,
+        btleplug::api::WriteType::WithoutResponse,
+      )
+      .await?;
     Ok(())
   }
 
   async fn setup_notifications(&mut self) -> Result<()> {
     let device = self.device.as_ref().ok_or("Device not connected")?;
-    
+
     // Discover characteristics
-    let eeg_uuids = [EEG_TP9_UUID, EEG_AF7_UUID, EEG_AF8_UUID, EEG_TP10_UUID, EEG_AUX_UUID];
+    let eeg_uuids = [
+      EEG_TP9_UUID,
+      EEG_AF7_UUID,
+      EEG_AF8_UUID,
+      EEG_TP10_UUID,
+      EEG_AUX_UUID,
+    ];
     let ppg_uuids = [PPG_AMBIENT_UUID, PPG_INFRARED_UUID, PPG_RED_UUID];
-    
+
     let mut chars = self.characteristics.lock().await;
-    
+
     for service in device.services() {
       for char in service.characteristics {
         let char_uuid = char.uuid;
         if eeg_uuids.contains(&char_uuid) || ppg_uuids.contains(&char_uuid) {
           chars.insert(char_uuid, char.clone());
-          
+
           // Subscribe to characteristic notifications
           device.subscribe(&char).await?;
         } else if char_uuid == CONTROL_UUID {
@@ -248,40 +266,43 @@ impl BleConnector<PlatformPeripheral> {
         }
       }
     }
-    
+
     // Start a task to read notifications and send them through the channel
     if let Some(data_tx) = &self.data_tx {
       let tx = data_tx.clone();
       let device_clone = device.clone();
       let streaming = self.streaming.clone();
-      
+
       tokio::spawn(async move {
         let mut notifications = device_clone.notifications().await.unwrap();
         let mut chunks = ChannelChunks::new();
-        
+
         while let Some(notification) = notifications.next().await {
           let streaming_guard = streaming.read().await;
           if *streaming_guard {
             let char_uuid = notification.uuid;
             let data = notification.value;
-            
+
             if eeg_uuids.contains(&char_uuid) {
               // Handle EEG data - parse as raw bytes for chunking
               if let Ok(channel_values) = parse_eeg_data(&data) {
-                let channel_idx = eeg_uuids.iter().position(|&uuid| uuid == char_uuid).unwrap();
-                
+                let channel_idx = eeg_uuids
+                  .iter()
+                  .position(|&uuid| uuid == char_uuid)
+                  .unwrap();
+
                 // Store chunk data for this channel
                 if channel_values.len() >= EEG_CHUNK_SIZE {
                   chunks.eeg_chunks[channel_idx].copy_from_slice(&channel_values[..EEG_CHUNK_SIZE]);
                 }
-                
+
                 // Check if this is the last channel (AUX = index 4)
                 if channel_idx == 4 {
                   // Push all samples for this chunk
                   for sample_idx in 0..EEG_CHUNK_SIZE {
                     let sample: [f32; 5] = [
                       chunks.eeg_chunks[0][sample_idx] as f32,
-                      chunks.eeg_chunks[1][sample_idx] as f32, 
+                      chunks.eeg_chunks[1][sample_idx] as f32,
                       chunks.eeg_chunks[2][sample_idx] as f32,
                       chunks.eeg_chunks[3][sample_idx] as f32,
                       chunks.eeg_chunks[4][sample_idx] as f32,
@@ -294,13 +315,16 @@ impl BleConnector<PlatformPeripheral> {
             } else if ppg_uuids.contains(&char_uuid) {
               // Handle PPG data - decode 24-bit values
               if let Ok(decoded_values) = parse_ppg_data(&data) {
-                let channel_idx = ppg_uuids.iter().position(|&uuid| uuid == char_uuid).unwrap();
-                
+                let channel_idx = ppg_uuids
+                  .iter()
+                  .position(|&uuid| uuid == char_uuid)
+                  .unwrap();
+
                 // Store chunk data for this channel
                 if decoded_values.len() >= PPG_CHUNK_SIZE {
                   chunks.ppg_chunks[channel_idx].copy_from_slice(&decoded_values[..PPG_CHUNK_SIZE]);
                 }
-                
+
                 // Check if this is the last channel (RED = index 2)
                 if channel_idx == 2 {
                   // Push all samples for this chunk
@@ -320,7 +344,7 @@ impl BleConnector<PlatformPeripheral> {
         }
       });
     }
-    
+
     Ok(())
   }
 
@@ -349,17 +373,17 @@ fn parse_ppg_data(data: &[u8]) -> Result<Vec<f32>> {
 fn decode_unsigned_24_bit_data(samples: &[u8]) -> Result<Vec<f32>> {
   let mut decoded_samples = Vec::new();
   let num_bytes_per_sample = 3;
-  
+
   for chunk in samples.chunks(num_bytes_per_sample) {
     if chunk.len() == num_bytes_per_sample {
       let most_significant_byte = (chunk[0] as u32) << 16;
       let middle_byte = (chunk[1] as u32) << 8;
       let least_significant_byte = chunk[2] as u32;
-      
+
       let val = most_significant_byte | middle_byte | least_significant_byte;
       decoded_samples.push(val as f32);
     }
   }
-  
+
   Ok(decoded_samples)
 }
