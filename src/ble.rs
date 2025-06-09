@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-use uuid::Uuid;
+use uuid::{Uuid, uuid};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const MUSE_SERVICE_UUID: &str = "0000fe8d-0000-1000-8000-00805f9b34fb";
+const MUSE_SERVICE_UUID: Uuid = uuid!("0000fe8d-0000-1000-8000-00805f9b34fb");
 const CONTROL_CHAR_UUID: &str = "273e0001-4c4d-454d-96be-f03bac821358";
 
 pub struct BleConnector<P: Peripheral> {
@@ -31,10 +31,9 @@ impl BleConnector<PlatformPeripheral> {
   }
 
   pub async fn connect(&mut self, target_uuid: Option<String>) -> Result<(String, String)> {
-    let service_uuid = Uuid::parse_str(MUSE_SERVICE_UUID)?;
+    let service_uuid = MUSE_SERVICE_UUID;
     let filter = ScanFilter {
       services: vec![service_uuid],
-      ..Default::default()
     };
 
     self.adapter.start_scan(filter).await?;

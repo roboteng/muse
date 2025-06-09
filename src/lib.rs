@@ -22,15 +22,13 @@ pub struct MuseDevice {
 impl MuseDevice {
   #[napi(constructor)]
   pub fn new(options: DeviceAdapterOptions) -> Self {
-    let target_uuid = options
-      .ble_uuid
-      .map(|js_str| js_str.into_utf8().unwrap().as_str().unwrap().to_string());
-    let rssi_interval_ms = options
-      .rssi_interval_ms
-      .map(|js_num| js_num.get_uint32().unwrap());
-    let xdf_record_path = options
-      .xdf_record_path
-      .map(|js_str| js_str.into_utf8().unwrap().as_str().unwrap().to_string());
+    let target_uuid = options.ble_uuid.and_then(|js_str| {
+      js_str.into_utf8().ok().and_then(|utf8| utf8.as_str().ok().map(|s| s.to_string()))
+    });
+    let rssi_interval_ms = options.rssi_interval_ms.and_then(|js_num| js_num.get_uint32().ok());
+    let xdf_record_path = options.xdf_record_path.and_then(|js_str| {
+      js_str.into_utf8().ok().and_then(|utf8| utf8.as_str().ok().map(|s| s.to_string()))
+    });
 
     Self {
       connector: Arc::new(Mutex::new(None)),
@@ -63,9 +61,9 @@ impl MuseDevice {
             napi::Error::from_reason(format!("Failed to connect to Muse device: {}", e))
           })?;
 
-      *self.connected.write().unwrap() = true;
-      *self.device_name.write().unwrap() = Some(device_name);
-      *self.device_uuid.write().unwrap() = Some(device_uuid);
+      *self.connected.write().map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = true;
+      *self.device_name.write().map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = Some(device_name);
+      *self.device_uuid.write().map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = Some(device_uuid);
     }
 
     Ok(())
@@ -92,9 +90,9 @@ impl MuseDevice {
         .map_err(|e| napi::Error::from_reason(format!("Failed to disconnect: {}", e)))?;
     }
 
-    *self.connected.write().unwrap() = false;
-    *self.device_name.write().unwrap() = None;
-    *self.device_uuid.write().unwrap() = None;
+    *self.connected.write().map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = false;
+    *self.device_name.write().map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = None;
+    *self.device_uuid.write().map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = None;
 
     Ok(())
   }
@@ -102,7 +100,7 @@ impl MuseDevice {
   /// @throws if its not connected
   #[napi(getter)]
   pub fn ble_name(&self, env: Env) -> Result<JsString> {
-    let name_guard = self.device_name.read().unwrap();
+    let name_guard = self.device_name.read().map_err(|_| napi::Error::from_reason("Failed to acquire read lock"))?;
     match name_guard.as_ref() {
       Some(name) => env.create_string(name),
       None => Err(napi::Error::from_reason("Device not connected")),
@@ -112,7 +110,7 @@ impl MuseDevice {
   /// @throws if its not connected
   #[napi(getter)]
   pub fn ble_uuid(&self, env: Env) -> Result<JsString> {
-    let uuid_guard = self.device_uuid.read().unwrap();
+    let uuid_guard = self.device_uuid.read().map_err(|_| napi::Error::from_reason("Failed to acquire read lock"))?;
     match uuid_guard.as_ref() {
       Some(uuid) => env.create_string(uuid),
       None => Err(napi::Error::from_reason("Device not connected")),
@@ -120,14 +118,14 @@ impl MuseDevice {
   }
 
   #[napi(getter)]
-  pub fn is_streaming(&self, env: Env) -> JsBoolean {
-    env.get_boolean(false).unwrap()
+  pub fn is_streaming(&self, env: Env) -> Result<JsBoolean> {
+    env.get_boolean(false)
   }
 
   #[napi(getter)]
-  pub fn is_connected(&self, env: Env) -> JsBoolean {
-    let connected = *self.connected.read().unwrap();
-    env.get_boolean(connected).unwrap()
+  pub fn is_connected(&self, env: Env) -> Result<JsBoolean> {
+    let connected = *self.connected.read().map_err(|_| napi::Error::from_reason("Failed to acquire read lock"))?;
+    env.get_boolean(connected)
   }
 }
 
