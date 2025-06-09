@@ -1,11 +1,14 @@
 use btleplug::platform::Peripheral as PlatformPeripheral;
 use napi::{Env, JsBoolean, JsNumber, JsString, Result};
 use napi_derive::napi;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio::sync::{Mutex, mpsc};
 
 mod ble;
 use ble::{BleConnector, DataType};
+
+// Global shared runtime for LSL operations to reduce thread creation
+static SHARED_LSL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 #[napi]
 pub struct MuseDevice {
@@ -104,13 +107,15 @@ impl MuseDevice {
         .await
         .map_err(|e| napi::Error::from_reason(format!("Failed to start streaming: {}", e)))?;
 
-      // Use spawn_blocking with a single-threaded runtime for LSL operations
+      // Use spawn_blocking with a shared runtime for LSL operations
       let _streaming_handle = tokio::task::spawn_blocking(move || {
-        // Create a single-threaded runtime for LSL operations (no Send required)
-        let rt = tokio::runtime::Builder::new_current_thread()
-          .enable_all()
-          .build()
-          .unwrap();
+        // Get or create the shared single-threaded runtime
+        let rt = SHARED_LSL_RUNTIME.get_or_init(|| {
+          tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create shared LSL runtime")
+        });
 
         rt.block_on(async { Self::streaming_task(data_rx).await });
       });
