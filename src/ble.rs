@@ -11,6 +11,10 @@ use uuid::{Uuid, uuid};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const MUSE_SERVICE_UUID: Uuid = uuid!("0000fe8d-0000-1000-8000-00805f9b34fb");
+
+// Control Characteristic UUID
+const CONTROL_UUID: Uuid = uuid!("273e0001-4c4d-454d-96be-f03bac821358");
+
 // EEG Characteristic UUIDs
 const EEG_TP9_UUID: Uuid = uuid!("273e0003-4c4d-454d-96be-f03bac821358");
 const EEG_AF7_UUID: Uuid = uuid!("273e0004-4c4d-454d-96be-f03bac821358");
@@ -27,6 +31,39 @@ const PPG_RED_UUID: Uuid = uuid!("273e0011-4c4d-454d-96be-f03bac821358");
 pub enum DataType {
   Eeg([f32; 5]),  // 5 EEG channels: TP9, AF7, AF8, TP10, AUX
   Ppg([f32; 3]),  // 3 PPG channels: AMBIENT, INFRARED, RED
+}
+
+// Data structures for chunking like TypeScript implementation
+const EEG_CHUNK_SIZE: usize = 12;
+const PPG_CHUNK_SIZE: usize = 6;
+const EEG_CHANNEL_COUNT: usize = 5;
+const PPG_CHANNEL_COUNT: usize = 3;
+
+#[derive(Clone)]
+struct ChannelChunks {
+  eeg_chunks: [[u8; EEG_CHUNK_SIZE]; EEG_CHANNEL_COUNT], // [channel_count][chunk_size] 
+  ppg_chunks: [[f32; PPG_CHUNK_SIZE]; PPG_CHANNEL_COUNT], // [channel_count][chunk_size]
+}
+
+impl ChannelChunks {
+  fn new() -> Self {
+    Self {
+      eeg_chunks: [[0u8; EEG_CHUNK_SIZE]; EEG_CHANNEL_COUNT],
+      ppg_chunks: [[0.0f32; PPG_CHUNK_SIZE]; PPG_CHANNEL_COUNT],
+    }
+  }
+  
+  fn reset_eeg(&mut self) {
+    for chunk in &mut self.eeg_chunks {
+      chunk.fill(0);
+    }
+  }
+  
+  fn reset_ppg(&mut self) {
+    for chunk in &mut self.ppg_chunks {
+      chunk.fill(0.0);
+    }
+  }
 }
 
 pub struct BleConnector<P: Peripheral> {
@@ -137,11 +174,19 @@ impl BleConnector<PlatformPeripheral> {
     // Discover and setup characteristics for notifications
     self.setup_notifications().await?;
     
+    // Send device control commands like TypeScript implementation
+    for command in &["h", "p50", "s", "d"] {
+      self.send_control_command(command.as_bytes()).await?;
+    }
+    
     *self.streaming.write().await = true;
     Ok(())
   }
 
   pub async fn stop_streaming(&mut self) -> Result<()> {
+    // Send halt command like TypeScript implementation
+    self.send_control_command("h".as_bytes()).await?;
+    
     *self.streaming.write().await = false;
     
     // Stop notifications on all characteristics
@@ -162,6 +207,24 @@ impl BleConnector<PlatformPeripheral> {
   }
 
 
+  async fn send_control_command(&self, cmd: &[u8]) -> Result<()> {
+    let device = self.device.as_ref().ok_or("Device not connected")?;
+    let control_char = self.get_characteristic(&CONTROL_UUID).await
+      .ok_or("Control characteristic not found")?;
+    
+    // Create command buffer like TypeScript implementation: X{cmd}\n
+    let mut buffer = Vec::with_capacity(cmd.len() + 2);
+    buffer.push(b'X');
+    buffer.extend_from_slice(cmd);
+    buffer.push(b'\n');
+    
+    // Set first byte to length - 1 (like TypeScript encoded[0] = encoded.length - 1)
+    buffer[0] = (buffer.len() - 1) as u8;
+    
+    device.write(&control_char, &buffer, btleplug::api::WriteType::WithResponse).await?;
+    Ok(())
+  }
+
   async fn setup_notifications(&mut self) -> Result<()> {
     let device = self.device.as_ref().ok_or("Device not connected")?;
     
@@ -179,6 +242,9 @@ impl BleConnector<PlatformPeripheral> {
           
           // Subscribe to characteristic notifications
           device.subscribe(&char).await?;
+        } else if char_uuid == CONTROL_UUID {
+          // Store control characteristic for sending commands
+          chars.insert(char_uuid, char.clone());
         }
       }
     }
@@ -191,6 +257,7 @@ impl BleConnector<PlatformPeripheral> {
       
       tokio::spawn(async move {
         let mut notifications = device_clone.notifications().await.unwrap();
+        let mut chunks = ChannelChunks::new();
         
         while let Some(notification) = notifications.next().await {
           let streaming_guard = streaming.read().await;
@@ -198,24 +265,56 @@ impl BleConnector<PlatformPeripheral> {
             let char_uuid = notification.uuid;
             let data = notification.value;
             
-            if let Ok(parsed_data) = parse_muse_data(&data) {
-              let data_type = if eeg_uuids.contains(&char_uuid) {
-                if let Ok(eeg_array) = parsed_data.get(0..5).unwrap_or(&[]).try_into() {
-                  DataType::Eeg(eeg_array)
-                } else {
-                  continue; // Skip if not enough EEG data
+            if eeg_uuids.contains(&char_uuid) {
+              // Handle EEG data - parse as raw bytes for chunking
+              if let Ok(channel_values) = parse_eeg_data(&data) {
+                let channel_idx = eeg_uuids.iter().position(|&uuid| uuid == char_uuid).unwrap();
+                
+                // Store chunk data for this channel
+                if channel_values.len() >= EEG_CHUNK_SIZE {
+                  chunks.eeg_chunks[channel_idx].copy_from_slice(&channel_values[..EEG_CHUNK_SIZE]);
                 }
-              } else if ppg_uuids.contains(&char_uuid) {
-                if let Ok(ppg_array) = parsed_data.get(0..3).unwrap_or(&[]).try_into() {
-                  DataType::Ppg(ppg_array)
-                } else {
-                  continue; // Skip if not enough PPG data
+                
+                // Check if this is the last channel (AUX = index 4)
+                if channel_idx == 4 {
+                  // Push all samples for this chunk
+                  for sample_idx in 0..EEG_CHUNK_SIZE {
+                    let sample: [f32; 5] = [
+                      chunks.eeg_chunks[0][sample_idx] as f32,
+                      chunks.eeg_chunks[1][sample_idx] as f32, 
+                      chunks.eeg_chunks[2][sample_idx] as f32,
+                      chunks.eeg_chunks[3][sample_idx] as f32,
+                      chunks.eeg_chunks[4][sample_idx] as f32,
+                    ];
+                    let _ = tx.send(DataType::Eeg(sample));
+                  }
+                  chunks.reset_eeg();
                 }
-              } else {
-                continue;
-              };
-              
-              let _ = tx.send(data_type);
+              }
+            } else if ppg_uuids.contains(&char_uuid) {
+              // Handle PPG data - decode 24-bit values
+              if let Ok(decoded_values) = parse_ppg_data(&data) {
+                let channel_idx = ppg_uuids.iter().position(|&uuid| uuid == char_uuid).unwrap();
+                
+                // Store chunk data for this channel
+                if decoded_values.len() >= PPG_CHUNK_SIZE {
+                  chunks.ppg_chunks[channel_idx].copy_from_slice(&decoded_values[..PPG_CHUNK_SIZE]);
+                }
+                
+                // Check if this is the last channel (RED = index 2)
+                if channel_idx == 2 {
+                  // Push all samples for this chunk
+                  for sample_idx in 0..PPG_CHUNK_SIZE {
+                    let sample: [f32; 3] = [
+                      chunks.ppg_chunks[0][sample_idx],
+                      chunks.ppg_chunks[1][sample_idx],
+                      chunks.ppg_chunks[2][sample_idx],
+                    ];
+                    let _ = tx.send(DataType::Ppg(sample));
+                  }
+                  chunks.reset_ppg();
+                }
+              }
             }
           }
         }
@@ -230,17 +329,37 @@ impl BleConnector<PlatformPeripheral> {
   }
 }
 
-fn parse_muse_data(data: &[u8]) -> Result<Vec<f32>> {
-  // Parse Muse data format (this is a simplified version)
-  // The actual format may need adjustment based on Muse protocol
-  let mut samples = Vec::new();
+fn parse_eeg_data(data: &[u8]) -> Result<Vec<u8>> {
+  // EEG data: slice from index 2 like TypeScript (Array.from(data).slice(2))
+  if data.len() < 2 {
+    return Err("EEG data too short".into());
+  }
+  Ok(data[2..].to_vec())
+}
+
+fn parse_ppg_data(data: &[u8]) -> Result<Vec<f32>> {
+  // PPG data: slice from index 2, then decode as 24-bit unsigned integers
+  if data.len() < 2 {
+    return Err("PPG data too short".into());
+  }
+  let channel_values = &data[2..];
+  decode_unsigned_24_bit_data(channel_values)
+}
+
+fn decode_unsigned_24_bit_data(samples: &[u8]) -> Result<Vec<f32>> {
+  let mut decoded_samples = Vec::new();
+  let num_bytes_per_sample = 3;
   
-  for chunk in data.chunks(4) {
-    if chunk.len() == 4 {
-      let value = i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32;
-      samples.push(value);
+  for chunk in samples.chunks(num_bytes_per_sample) {
+    if chunk.len() == num_bytes_per_sample {
+      let most_significant_byte = (chunk[0] as u32) << 16;
+      let middle_byte = (chunk[1] as u32) << 8;
+      let least_significant_byte = chunk[2] as u32;
+      
+      let val = most_significant_byte | middle_byte | least_significant_byte;
+      decoded_samples.push(val as f32);
     }
   }
   
-  Ok(samples)
+  Ok(decoded_samples)
 }

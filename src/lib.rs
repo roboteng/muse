@@ -174,8 +174,8 @@ impl MuseDevice {
   async fn streaming_task(mut data_rx: mpsc::UnboundedReceiver<DataType>) {
     use lsl::{StreamOutlet, StreamInfo, ChannelFormat, Pushable};
     
-    // Create LSL outlets
-    let eeg_info = match StreamInfo::new(
+    // Create EEG StreamInfo with metadata
+    let mut eeg_info = match StreamInfo::new(
       "Muse S Gen 2 EEG",
       "EEG", 
       5, // 5 EEG channels
@@ -187,12 +187,32 @@ impl MuseDevice {
       Err(_) => return, // Exit task if we can't create stream info
     };
     
+    // Add EEG metadata
+    eeg_info.desc().append_child_value("manufacturer", "Interaxon");
+    
+    // Add EEG channel information
+    let mut eeg_channels = eeg_info.desc().append_child("channels");
+    let eeg_channel_names = ["EEG_TP9", "EEG_AF7", "EEG_AF8", "EEG_TP10", "EEG_AUX"];
+    
+    for channel_name in &eeg_channel_names {
+      eeg_channels.append_child("channel")
+        .append_child_value("label", channel_name)
+        .append_child_value("unit", "microvolt")
+        .append_child_value("type", "EEG");
+    }
+    
+    // Add acquisition system metadata
+    eeg_info.desc().append_child("acquisition")
+      .append_child_value("manufacturer", "Interaxon")
+      .append_child_value("model", "Muse S Gen 2");
+    
     let eeg_outlet = match StreamOutlet::new(&eeg_info, 12, 360) {
       Ok(outlet) => outlet,
       Err(_) => return,
     };
 
-    let ppg_info = match StreamInfo::new(
+    // Create PPG StreamInfo with metadata
+    let mut ppg_info = match StreamInfo::new(
       "Muse S Gen 2 PPG",
       "PPG",
       3, // 3 PPG channels
@@ -203,6 +223,25 @@ impl MuseDevice {
       Ok(info) => info,
       Err(_) => return,
     };
+    
+    // Add PPG metadata
+    ppg_info.desc().append_child_value("manufacturer", "Interaxon");
+    
+    // Add PPG channel information
+    let mut ppg_channels = ppg_info.desc().append_child("channels");
+    let ppg_channel_names = ["PPG_AMBIENT", "PPG_INFRARED", "PPG_RED"];
+    
+    for channel_name in &ppg_channel_names {
+      ppg_channels.append_child("channel")
+        .append_child_value("label", channel_name)
+        .append_child_value("unit", "N/A")
+        .append_child_value("type", "PPG");
+    }
+    
+    // Add acquisition system metadata
+    ppg_info.desc().append_child("acquisition")
+      .append_child_value("manufacturer", "Interaxon")
+      .append_child_value("model", "Muse S Gen 2");
     
     let ppg_outlet = match StreamOutlet::new(&ppg_info, 6, 360) {
       Ok(outlet) => outlet,
