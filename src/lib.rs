@@ -1,8 +1,7 @@
 use btleplug::platform::Peripheral as PlatformPeripheral;
 use napi::{Env, JsBoolean, JsNumber, JsString, Result};
 use napi_derive::napi;
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 mod ble;
 mod lsl_manager;
@@ -16,7 +15,7 @@ use device_state::DeviceStateManager;
 
 #[napi]
 pub struct MuseDevice {
-  connector: Arc<Mutex<Option<BleConnector<PlatformPeripheral>>>>,
+  connector: Arc<tokio::sync::Mutex<Option<BleConnector<PlatformPeripheral>>>>,
   target_uuid: Option<String>,
   #[allow(dead_code)]
   rssi_interval_ms: Option<u32>,
@@ -46,7 +45,7 @@ impl MuseDevice {
     });
 
     Self {
-      connector: Arc::new(Mutex::new(None)),
+      connector: Arc::new(tokio::sync::Mutex::new(None)),
       target_uuid,
       rssi_interval_ms,
       xdf_record_path,
@@ -75,7 +74,7 @@ impl MuseDevice {
           })?;
 
       // Update device state
-      self.state.lock().await.set_connected(device_name, device_uuid);
+      self.state.lock().unwrap().set_connected(device_name, device_uuid);
     }
 
     Ok(())
@@ -87,7 +86,7 @@ impl MuseDevice {
 
     if let Some(connector) = connector_guard.as_mut() {
       // Create channel for data streaming
-      let (data_tx, data_rx) = mpsc::unbounded_channel::<DataType>();
+      let (data_tx, data_rx) = mpsc::channel::<DataType>();
 
       // Start BLE streaming with the sender
       connector
@@ -97,11 +96,11 @@ impl MuseDevice {
 
       // Use blocking LSL operations without async runtime to reduce thread creation
       let _streaming_handle = std::thread::spawn(move || {
-        LslStreamManager::process_data_stream_blocking(data_rx);
+        LslStreamManager::process_data_stream_simple(data_rx);
       });
 
       // Update streaming state
-      self.state.lock().await.set_streaming_started()
+      self.state.lock().unwrap().set_streaming_started()
         .map_err(|e| napi::Error::from_reason(e))?;
     } else {
       return Err(napi::Error::from_reason("Device not connected"));
@@ -125,10 +124,10 @@ impl MuseDevice {
     // due to BLE connector cleanup above
     
     // Brief pause to allow LSL cleanup to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    std::thread::sleep(std::time::Duration::from_millis(100));
 
     // Update streaming state
-    self.state.lock().await.set_streaming_stopped();
+    self.state.lock().unwrap().set_streaming_stopped();
 
     Ok(())
   }
@@ -137,7 +136,7 @@ impl MuseDevice {
   pub async fn restart_streaming(&self) -> napi::Result<()> {
     // Stop and restart without full disconnect to avoid thread churn
     self.stop_streaming().await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await; // Brief pause for cleanup
+    std::thread::sleep(std::time::Duration::from_millis(200)); // Brief pause for cleanup
     self.start_streaming().await?;
     Ok(())
   }
@@ -154,7 +153,7 @@ impl MuseDevice {
     }
 
     // Update device state
-    self.state.lock().await.set_disconnected();
+    self.state.lock().unwrap().set_disconnected();
 
     Ok(())
   }

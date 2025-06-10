@@ -4,7 +4,8 @@ use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock};
+use std::sync::mpsc;
 use tokio::time::timeout;
 use uuid::{Uuid, uuid};
 
@@ -71,7 +72,7 @@ pub struct BleConnector<P: Peripheral> {
   device: Option<P>,
   characteristics: Mutex<HashMap<Uuid, Characteristic>>,
   streaming: Arc<RwLock<bool>>,
-  data_tx: Option<mpsc::UnboundedSender<DataType>>,
+  data_tx: Option<mpsc::Sender<DataType>>,
 }
 
 impl BleConnector<PlatformPeripheral> {
@@ -163,7 +164,7 @@ impl BleConnector<PlatformPeripheral> {
     self.device.is_some()
   }
 
-  pub async fn start_streaming(&mut self, data_tx: mpsc::UnboundedSender<DataType>) -> Result<()> {
+  pub async fn start_streaming(&mut self, data_tx: mpsc::Sender<DataType>) -> Result<()> {
     if !self.is_connected() {
       return Err("Device not connected".into());
     }
