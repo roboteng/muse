@@ -1,11 +1,16 @@
 use btleplug::platform::Peripheral as PlatformPeripheral;
 use napi::{Env, JsBoolean, JsNumber, JsString, Result};
 use napi_derive::napi;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, mpsc};
 
 mod ble;
+mod lsl_manager;
+mod device_state;
+
 use ble::{BleConnector, DataType};
+use lsl_manager::LslStreamManager;
+use device_state::DeviceStateManager;
 
 // Global shared runtime for LSL operations to reduce thread creation
 static SHARED_LSL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -18,10 +23,7 @@ pub struct MuseDevice {
   rssi_interval_ms: Option<u32>,
   #[allow(dead_code)]
   xdf_record_path: Option<String>,
-  connected: Arc<RwLock<bool>>,
-  device_name: Arc<RwLock<Option<String>>>,
-  device_uuid: Arc<RwLock<Option<String>>>,
-  streaming: Arc<RwLock<bool>>,
+  state: Arc<Mutex<DeviceStateManager>>,
 }
 
 #[napi]
@@ -49,10 +51,7 @@ impl MuseDevice {
       target_uuid,
       rssi_interval_ms,
       xdf_record_path,
-      connected: Arc::new(RwLock::new(false)),
-      device_name: Arc::new(RwLock::new(None)),
-      device_uuid: Arc::new(RwLock::new(None)),
-      streaming: Arc::new(RwLock::new(false)),
+      state: Arc::new(Mutex::new(DeviceStateManager::new())),
     }
   }
 
@@ -76,18 +75,8 @@ impl MuseDevice {
             napi::Error::from_reason(format!("Failed to connect to Muse device: {}", e))
           })?;
 
-      *self
-        .connected
-        .write()
-        .map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = true;
-      *self
-        .device_name
-        .write()
-        .map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = Some(device_name);
-      *self
-        .device_uuid
-        .write()
-        .map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = Some(device_uuid);
+      // Update device state
+      self.state.lock().await.set_connected(device_name, device_uuid);
     }
 
     Ok(())
@@ -117,15 +106,12 @@ impl MuseDevice {
             .expect("Failed to create shared LSL runtime")
         });
 
-        rt.block_on(async { Self::streaming_task(data_rx).await });
+        rt.block_on(async { LslStreamManager::process_data_stream(data_rx).await });
       });
 
-      // Note: We don't store the handle since it has different type
-      // Cleanup happens when data_rx channel closes during stop_streaming
-      *self
-        .streaming
-        .write()
-        .map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = true;
+      // Update streaming state
+      self.state.lock().await.set_streaming_started()
+        .map_err(|e| napi::Error::from_reason(e))?;
     } else {
       return Err(napi::Error::from_reason("Device not connected"));
     }
@@ -146,12 +132,22 @@ impl MuseDevice {
 
     // Note: Background streaming task will stop when data_rx channel closes
     // due to BLE connector cleanup above
+    
+    // Brief pause to allow LSL cleanup to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    *self
-      .streaming
-      .write()
-      .map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = false;
+    // Update streaming state
+    self.state.lock().await.set_streaming_stopped();
 
+    Ok(())
+  }
+
+  #[napi]
+  pub async fn restart_streaming(&self) -> napi::Result<()> {
+    // Stop and restart without full disconnect to avoid thread churn
+    self.stop_streaming().await?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await; // Brief pause for cleanup
+    self.start_streaming().await?;
     Ok(())
   }
 
@@ -166,18 +162,8 @@ impl MuseDevice {
         .map_err(|e| napi::Error::from_reason(format!("Failed to disconnect: {}", e)))?;
     }
 
-    *self
-      .connected
-      .write()
-      .map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = false;
-    *self
-      .device_name
-      .write()
-      .map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = None;
-    *self
-      .device_uuid
-      .write()
-      .map_err(|_| napi::Error::from_reason("Failed to acquire write lock"))? = None;
+    // Update device state
+    self.state.lock().await.set_disconnected();
 
     Ok(())
   }
@@ -185,11 +171,9 @@ impl MuseDevice {
   /// @throws if its not connected
   #[napi(getter)]
   pub fn ble_name(&self, env: Env) -> Result<JsString> {
-    let name_guard = self
-      .device_name
-      .read()
-      .map_err(|_| napi::Error::from_reason("Failed to acquire read lock"))?;
-    match name_guard.as_ref() {
+    let state = self.state.try_lock()
+      .map_err(|_| napi::Error::from_reason("Failed to acquire state lock"))?;
+    match state.get_device_name() {
       Some(name) => env.create_string(name),
       None => Err(napi::Error::from_reason("Device not connected")),
     }
@@ -198,11 +182,9 @@ impl MuseDevice {
   /// @throws if its not connected
   #[napi(getter)]
   pub fn ble_uuid(&self, env: Env) -> Result<JsString> {
-    let uuid_guard = self
-      .device_uuid
-      .read()
-      .map_err(|_| napi::Error::from_reason("Failed to acquire read lock"))?;
-    match uuid_guard.as_ref() {
+    let state = self.state.try_lock()
+      .map_err(|_| napi::Error::from_reason("Failed to acquire state lock"))?;
+    match state.get_device_uuid() {
       Some(uuid) => env.create_string(uuid),
       None => Err(napi::Error::from_reason("Device not connected")),
     }
@@ -210,121 +192,18 @@ impl MuseDevice {
 
   #[napi(getter)]
   pub fn is_streaming(&self, env: Env) -> Result<JsBoolean> {
-    let streaming = *self
-      .streaming
-      .read()
-      .map_err(|_| napi::Error::from_reason("Failed to acquire read lock"))?;
-    env.get_boolean(streaming)
+    let state = self.state.try_lock()
+      .map_err(|_| napi::Error::from_reason("Failed to acquire state lock"))?;
+    env.get_boolean(state.is_streaming())
   }
 
   #[napi(getter)]
   pub fn is_connected(&self, env: Env) -> Result<JsBoolean> {
-    let connected = *self
-      .connected
-      .read()
-      .map_err(|_| napi::Error::from_reason("Failed to acquire read lock"))?;
-    env.get_boolean(connected)
+    let state = self.state.try_lock()
+      .map_err(|_| napi::Error::from_reason("Failed to acquire state lock"))?;
+    env.get_boolean(state.is_connected())
   }
 
-  async fn streaming_task(mut data_rx: mpsc::UnboundedReceiver<DataType>) {
-    use lsl::{ChannelFormat, Pushable, StreamInfo, StreamOutlet};
-
-    // Create EEG StreamInfo with metadata
-    let mut eeg_info = match StreamInfo::new(
-      "Muse S Gen 2 EEG",
-      "EEG",
-      5,     // 5 EEG channels
-      256.0, // EEG sample rate
-      ChannelFormat::Float32,
-      "muse-eeg",
-    ) {
-      Ok(info) => info,
-      Err(_) => return, // Exit task if we can't create stream info
-    };
-
-    // Add EEG metadata
-    eeg_info
-      .desc()
-      .append_child_value("manufacturer", "Interaxon");
-
-    // Add EEG channel information
-    let mut eeg_channels = eeg_info.desc().append_child("channels");
-    let eeg_channel_names = ["EEG_TP9", "EEG_AF7", "EEG_AF8", "EEG_TP10", "EEG_AUX"];
-
-    for channel_name in &eeg_channel_names {
-      eeg_channels
-        .append_child("channel")
-        .append_child_value("label", channel_name)
-        .append_child_value("unit", "microvolt")
-        .append_child_value("type", "EEG");
-    }
-
-    // Add acquisition system metadata
-    eeg_info
-      .desc()
-      .append_child("acquisition")
-      .append_child_value("manufacturer", "Interaxon")
-      .append_child_value("model", "Muse S Gen 2");
-
-    let eeg_outlet = match StreamOutlet::new(&eeg_info, 12, 360) {
-      Ok(outlet) => outlet,
-      Err(_) => return,
-    };
-
-    // Create PPG StreamInfo with metadata
-    let mut ppg_info = match StreamInfo::new(
-      "Muse S Gen 2 PPG",
-      "PPG",
-      3,    // 3 PPG channels
-      64.0, // PPG sample rate
-      ChannelFormat::Float32,
-      "muse-s-ppg",
-    ) {
-      Ok(info) => info,
-      Err(_) => return,
-    };
-
-    // Add PPG metadata
-    ppg_info
-      .desc()
-      .append_child_value("manufacturer", "Interaxon");
-
-    // Add PPG channel information
-    let mut ppg_channels = ppg_info.desc().append_child("channels");
-    let ppg_channel_names = ["PPG_AMBIENT", "PPG_INFRARED", "PPG_RED"];
-
-    for channel_name in &ppg_channel_names {
-      ppg_channels
-        .append_child("channel")
-        .append_child_value("label", channel_name)
-        .append_child_value("unit", "N/A")
-        .append_child_value("type", "PPG");
-    }
-
-    // Add acquisition system metadata
-    ppg_info
-      .desc()
-      .append_child("acquisition")
-      .append_child_value("manufacturer", "Interaxon")
-      .append_child_value("model", "Muse S Gen 2");
-
-    let ppg_outlet = match StreamOutlet::new(&ppg_info, 6, 360) {
-      Ok(outlet) => outlet,
-      Err(_) => return,
-    };
-
-    // Process incoming data
-    while let Some(data_type) = data_rx.recv().await {
-      match data_type {
-        DataType::Eeg(samples) => {
-          let _ = eeg_outlet.push_sample(&samples.to_vec());
-        }
-        DataType::Ppg(samples) => {
-          let _ = ppg_outlet.push_sample(&samples.to_vec());
-        }
-      }
-    }
-  }
 }
 
 #[napi(object)]

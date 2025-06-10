@@ -14,6 +14,7 @@ export declare class MuseDevice {
   connect(): Promise<void>
   startStreaming(): Promise<void>
   stopStreaming(): Promise<void>
+  restartStreaming(): Promise<void>
   disconnect(): Promise<void>
   /** @throws if its not connected */
   get bleName(): string
