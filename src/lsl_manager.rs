@@ -1,5 +1,6 @@
 use lsl::{ChannelFormat, Pushable, StreamInfo, StreamOutlet};
 use tokio::sync::mpsc;
+use std::sync::mpsc as std_mpsc;
 use crate::ble::DataType;
 
 pub struct LslStreamManager {
@@ -120,6 +121,58 @@ impl LslStreamManager {
         while let Some(data_type) = data_rx.recv().await {
             if let Err(e) = lsl_manager.push_sample(data_type) {
                 eprintln!("Failed to push LSL sample: {}", e);
+            }
+        }
+
+        // Explicit cleanup happens automatically when lsl_manager is dropped
+    }
+
+    pub fn process_data_stream_blocking(mut data_rx: mpsc::UnboundedReceiver<DataType>) {
+        // Create the LSL manager
+        let lsl_manager = match Self::new() {
+            Ok(manager) => manager,
+            Err(e) => {
+                eprintln!("Failed to create LSL manager: {}", e);
+                return;
+            }
+        };
+
+        // Use blocking_recv instead of async recv to avoid tokio runtime
+        let rt = tokio::runtime::Handle::try_current();
+        if rt.is_ok() {
+            // We're in a tokio context, use async approach
+            let rt = rt.unwrap();
+            rt.block_on(async {
+                while let Some(data_type) = data_rx.recv().await {
+                    if let Err(e) = lsl_manager.push_sample(data_type) {
+                        eprintln!("Failed to push LSL sample: {}", e);
+                    }
+                }
+            });
+        } else {
+            // Convert to std channel for true blocking operation
+            let (std_tx, std_rx) = std_mpsc::channel::<DataType>();
+            
+            // Spawn a small tokio runtime just to drain the async channel
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("Failed to create drain runtime");
+                
+                rt.block_on(async {
+                    while let Some(data_type) = data_rx.recv().await {
+                        if std_tx.send(data_type).is_err() {
+                            break; // Main thread dropped the receiver
+                        }
+                    }
+                });
+            });
+
+            // Process data using blocking std channel
+            while let Ok(data_type) = std_rx.recv() {
+                if let Err(e) = lsl_manager.push_sample(data_type) {
+                    eprintln!("Failed to push LSL sample: {}", e);
+                }
             }
         }
 
